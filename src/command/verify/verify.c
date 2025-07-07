@@ -30,12 +30,31 @@ Verify contents of the repository.
 #include "protocol/helper.h"
 #include "protocol/parallel.h"
 #include "storage/helper.h"
+#include "common/type/json.h"
 
 /***********************************************************************************************************************************
 Constants
 ***********************************************************************************************************************************/
 #define VERIFY_STATUS_OK                                            "ok"
 #define VERIFY_STATUS_ERROR                                         "error"
+
+// Naming convention: <sectionname>_KEY_<keyname>_VAR. If the key exists in multiple sections, then <sectionname>_ is omitted.
+VARIANT_STRDEF_STATIC(KEY_ARCHIVES_VAR,                      "archives");
+VARIANT_STRDEF_STATIC(ARCHIVE_KEY_ARCHIVEID_VAR,             "archiveId");
+VARIANT_STRDEF_STATIC(ARCHIVE_KEY_CHECKED_VAR,               "checked");
+VARIANT_STRDEF_STATIC(KEY_VALID_VAR,                         "valid");
+VARIANT_STRDEF_STATIC(KEY_MISSING_VAR,                       "missing");
+VARIANT_STRDEF_STATIC(KEY_CHECKSUMINVALID_VAR,               "checksumInvalid");
+VARIANT_STRDEF_STATIC(KEY_SIZEINVALID_VAR,                   "sizeInvalid");
+VARIANT_STRDEF_STATIC(KEY_OTHER_VAR,                         "other");
+VARIANT_STRDEF_STATIC(KEY_BACKUPS_VAR,                       "backups");
+VARIANT_STRDEF_STATIC(BACKUP_KEY_LABEL_VAR,                  "label");
+VARIANT_STRDEF_STATIC(KEY_STATUS_VAR,                        "status");
+VARIANT_STRDEF_STATIC(BACKUP_KEY_CHECKED_VAR,                "checked");
+VARIANT_STRDEF_STATIC(KEY_ERRORS_VAR,                        "errors");
+VARIANT_STRDEF_STATIC(VERIFY_KEY_STANZA_VAR,                 "stanza");
+VARIANT_STRDEF_STATIC(VERIFY_KEY_STATUS_ERROR,               "error");
+VARIANT_STRDEF_STATIC(VERIFY_KEY_STATUS_OK,                  "ok");
 
 /***********************************************************************************************************************************
 Data Types and Structures
@@ -1430,12 +1449,13 @@ verifyCreateFileErrorsStr(
 Render the results of the verify command
 ***********************************************************************************************************************************/
 static String *
-verifyRender(const List *const archiveIdResultList, const List *const backupResultList, const bool verboseText)
+verifyRender(const List *const archiveIdResultList, const List *const backupResultList, const bool verboseText, KeyValue *const jsonKv)
 {
     FUNCTION_TEST_BEGIN();
         FUNCTION_TEST_PARAM(LIST, archiveIdResultList);             // Result list for all archive Ids in the repo
         FUNCTION_TEST_PARAM(LIST, backupResultList);                // Result list for all backups in the repo
         FUNCTION_TEST_PARAM(BOOL, verboseText);                     // Is verbose output requested?
+        FUNCTION_TEST_PARAM(KEY_VALUE, jsonKv);                     // Is JSON output requested?
     FUNCTION_TEST_END();
 
     FUNCTION_AUDIT_HELPER();
@@ -1446,28 +1466,48 @@ verifyRender(const List *const archiveIdResultList, const List *const backupResu
     String *const result = strNew();
 
     // Render archive results
-    if (verboseText && lstEmpty(archiveIdResultList))
+    VariantList *archivesList = NULL;
+    VariantList *backupsList = NULL;
+    if (jsonKv != NULL)
+    {
+        archivesList = varLstNew();
+        backupsList = varLstNew();
+    }
+
+    if (jsonKv == NULL && verboseText && lstEmpty(archiveIdResultList))
+    {
         strCatZ(result, "\n  archiveId: none found");
+    }
     else
     {
         for (unsigned int archiveIdx = 0; archiveIdx < lstSize(archiveIdResultList); archiveIdx++)
         {
             const VerifyArchiveResult *const archiveIdResult = lstGet(archiveIdResultList, archiveIdx);
+            KeyValue *const archiveKv = ((archivesList == NULL) ? NULL : kvNew());
 
-            if (verboseText || archiveIdResult->totalWalFile - archiveIdResult->totalValidWal != 0)
+            if (verboseText || jsonKv != NULL || archiveIdResult->totalWalFile - archiveIdResult->totalValidWal != 0)
             {
-                strCatFmt(
-                    result, "\n  archiveId: %s, total WAL checked: %u, total valid WAL: %u", strZ(archiveIdResult->archiveId),
-                    archiveIdResult->totalWalFile, archiveIdResult->totalValidWal);
+                if (archiveKv != NULL)
+                {
+                    kvPut(archiveKv, ARCHIVE_KEY_ARCHIVEID_VAR, VARSTR(archiveIdResult->archiveId));
+                    kvPut(archiveKv, ARCHIVE_KEY_CHECKED_VAR, VARUINT(archiveIdResult->totalWalFile));
+                    kvPut(archiveKv, KEY_VALID_VAR, VARUINT(archiveIdResult->totalValidWal));
+                }
+                else
+                {
+                    strCatFmt(
+                        result, "\n  archiveId: %s, total WAL checked: %u, total valid WAL: %u", strZ(archiveIdResult->archiveId),
+                        archiveIdResult->totalWalFile, archiveIdResult->totalValidWal);
+                }
             }
+
+            unsigned int errMissing = 0;
+            unsigned int errChecksum = 0;
+            unsigned int errSize = 0;
+            unsigned int errOther = 0;
 
             if (archiveIdResult->totalWalFile > 0)
             {
-                unsigned int errMissing = 0;
-                unsigned int errChecksum = 0;
-                unsigned int errSize = 0;
-                unsigned int errOther = 0;
-
                 for (unsigned int walIdx = 0; walIdx < lstSize(archiveIdResult->walRangeList); walIdx++)
                 {
                     const VerifyWalRange *const walRange = lstGet(archiveIdResult->walRangeList, walIdx);
@@ -1496,21 +1536,33 @@ verifyRender(const List *const archiveIdResultList, const List *const backupResu
                 }
 
                 // Create/append file errors string
-                if (verboseText || errMissing + errChecksum + errSize + errOther > 0)
+                if (jsonKv == NULL && (verboseText || errMissing + errChecksum + errSize + errOther > 0))
                     strCat(result, verifyCreateFileErrorsStr(errMissing, errChecksum, errSize, errOther, verboseText));
+            }
+
+            if (archiveKv != NULL)
+            {
+                kvPut(archiveKv, KEY_MISSING_VAR, VARUINT(errMissing));
+                kvPut(archiveKv, KEY_CHECKSUMINVALID_VAR, VARUINT(errChecksum));
+                kvPut(archiveKv, KEY_SIZEINVALID_VAR, VARUINT(errSize));
+                kvPut(archiveKv, KEY_OTHER_VAR, VARUINT(errOther));
+
+                varLstAdd(archivesList, varNewKv(archiveKv));
             }
         }
     }
-
     // Render backup results
-    if (verboseText && lstEmpty(backupResultList))
+    if (jsonKv == NULL && verboseText && lstEmpty(backupResultList))
+    {
         strCatZ(result, "\n  backup: none found");
+    }
     else
     {
         for (unsigned int backupIdx = 0; backupIdx < lstSize(backupResultList); backupIdx++)
         {
             const VerifyBackupResult *const backupResult = lstGet(backupResultList, backupIdx);
             const char *status;
+            KeyValue *const backupKv = backupsList == NULL ? NULL : kvNew();
 
             switch (backupResult->status)
             {
@@ -1535,19 +1587,27 @@ verifyRender(const List *const archiveIdResultList, const List *const backupResu
                 }
             }
 
-            if (verboseText || (strcmp(status, "valid") != 0 && strcmp(status, "in-progress") != 0))
+            if (backupKv != NULL)
+            {
+                kvPut(backupKv, BACKUP_KEY_LABEL_VAR, VARSTR(backupResult->backupLabel));
+                kvPut(backupKv, KEY_STATUS_VAR, VARSTRZ(status));
+                kvPut(backupKv, BACKUP_KEY_CHECKED_VAR, VARUINT(backupResult->totalFileVerify));
+                kvPut(backupKv, KEY_VALID_VAR, VARUINT(backupResult->totalFileValid));
+            }
+            else if (verboseText || (strcmp(status, "valid") != 0 && strcmp(status, "in-progress") != 0))
             {
                 strCatFmt(
                     result, "\n  backup: %s, status: %s, total files checked: %u, total valid files: %u",
                     strZ(backupResult->backupLabel), status, backupResult->totalFileVerify, backupResult->totalFileValid);
             }
 
+            unsigned int errMissing = 0;
+            unsigned int errChecksum = 0;
+            unsigned int errSize = 0;
+            unsigned int errOther = 0;
+
             if (backupResult->totalFileVerify > 0)
             {
-                unsigned int errMissing = 0;
-                unsigned int errChecksum = 0;
-                unsigned int errSize = 0;
-                unsigned int errOther = 0;
 
                 for (unsigned int invalidIdx = 0; invalidIdx < lstSize(backupResult->invalidFileList); invalidIdx++)
                 {
@@ -1564,10 +1624,30 @@ verifyRender(const List *const archiveIdResultList, const List *const backupResu
                 }
 
                 // Create/append file errors string
-                if (verboseText || errMissing + errChecksum + errSize + errOther > 0)
+                if (backupKv == NULL && (verboseText || errMissing + errChecksum + errSize + errOther > 0))
+                {
                     strCat(result, verifyCreateFileErrorsStr(errMissing, errChecksum, errSize, errOther, verboseText));
+                }
+            }
+
+            if (backupKv != NULL)
+            {
+                kvPut(backupKv, KEY_MISSING_VAR, VARUINT(errMissing));
+                kvPut(backupKv, KEY_CHECKSUMINVALID_VAR, VARUINT(errChecksum));
+                kvPut(backupKv, KEY_SIZEINVALID_VAR, VARUINT(errSize));
+                kvPut(backupKv, KEY_OTHER_VAR, VARUINT(errOther));
+                varLstAdd(backupsList, varNewKv(backupKv));
             }
         }
+    }
+
+    if (jsonKv != NULL)
+    {
+        kvPut(jsonKv, KEY_ARCHIVES_VAR, varNewVarLst(archivesList));
+        kvPut(jsonKv, KEY_BACKUPS_VAR, varNewVarLst(backupsList));
+
+        // Provide JSON based output as well to make testing easier
+        strCat(result, jsonFromVar(varNewKv(jsonKv)));
     }
 
     FUNCTION_TEST_RETURN(STRING, result);
@@ -1584,11 +1664,14 @@ verifyProcess(const bool verboseText)
     FUNCTION_LOG_END();
 
     String *const result = strNew();
+    KeyValue * resultKv = NULL;
+    bool json = cfgOptionStrId(cfgOptOutput) == CFGOPTVAL_OUTPUT_JSON;
 
     MEM_CONTEXT_TEMP_BEGIN()
     {
         unsigned int errorTotal = 0;
         String *resultStr = strNew();
+        StringList *errorList = strLstNew();
 
         // Get the repo storage in case it is remote and encryption settings need to be pulled down
         const Storage *const storage = storageRepo();
@@ -1596,10 +1679,14 @@ verifyProcess(const bool verboseText)
         // Get a usable backup info file
         const InfoBackup *const backupInfo = verifyBackupInfoFile();
 
+        if (json) {
+            resultKv = kvNew();
+        }
+
         // If a usable backup.info file is not found, then report an error in the log
         if (backupInfo == NULL)
         {
-            strCatZ(resultStr, "\n  No usable backup.info file");
+            strLstAddZ(errorList, "No usable backup.info file");
             errorTotal++;
         }
 
@@ -1609,7 +1696,7 @@ verifyProcess(const bool verboseText)
         // If a usable archive.info file is not found, then report an error in the log
         if (archiveInfo == NULL)
         {
-            strCatZ(resultStr, "\n  No usable archive.info file");
+            strLstAddZ(errorList, "No usable archive.info file");
             errorTotal++;
         }
 
@@ -1623,7 +1710,7 @@ verifyProcess(const bool verboseText)
             }
             CATCH_ANY()
             {
-                strCatFmt(resultStr, "\n%s", errorMessage());
+                strLstAddZ(errorList, errorMessage());
                 errorTotal++;
             }
             TRY_END();
@@ -1654,7 +1741,7 @@ verifyProcess(const bool verboseText)
             {
                 if (!regExpMatchOne(backupRegExpStr, backupLabel))
                 {
-                    strCatFmt(resultStr, "\n  '%s' is not a valid backup label format", strZ(backupLabel));
+                    strLstAddFmt(errorList, "'%s' is not a valid backup label format", strZ(backupLabel));
 
                     backupLabelInvalid = true;
                     errorTotal++;
@@ -1672,7 +1759,7 @@ verifyProcess(const bool verboseText)
 
             if (!backupLabelInvalid && backupLabel != NULL && strLstEmpty(jobData.backupList))
             {
-                strCatFmt(resultStr, "\n  backup set %s is not valid", strZ(backupLabel));
+                strLstAddFmt(errorList, "backup set %s is not valid", strZ(backupLabel));
 
                 backupLabelInvalid = true;
                 errorTotal++;
@@ -1841,16 +1928,41 @@ verifyProcess(const bool verboseText)
                 // ??? Need to do the final reconciliation - checking backup required WAL against, valid WAL
 
                 // Report results
-                resultStr = verifyRender(jobData.archiveIdResultList, jobData.backupResultList, verboseText);
+                resultStr = verifyRender(jobData.archiveIdResultList, jobData.backupResultList, verboseText, resultKv);
             }
-            else if (!backupLabelInvalid)
-                strCatZ(resultStr, "\n    no archives or backups exist in the repo");
+            else if (!json && !backupLabelInvalid)
+	        strCatZ(resultStr, "\n    no archives or backups exist in the repo");
 
             errorTotal += jobData.jobErrorTotal;
         }
 
+        if (json)
+        {
+            kvPut(resultKv, VERIFY_KEY_STANZA_VAR, VARSTR(cfgOptionStr(cfgOptStanza)));
+            kvPut(resultKv, KEY_STATUS_VAR, errorTotal > 0 ? VERIFY_KEY_STATUS_ERROR : VERIFY_KEY_STATUS_OK);
+
+            if (strLstSize(errorList) > 0) {
+                VariantList *const errListVar = varLstNew();
+                for (unsigned int errIdx = 0; errIdx < strLstSize(errorList); errIdx++)
+                {
+                    String *const errStr = strLstGet(errorList, errIdx);
+                    varLstAdd(errListVar, varNewStr(errStr));
+                }
+
+                kvPut(resultKv, KEY_ERRORS_VAR, varNewVarLst(errListVar));
+            }
+
+            strCat(result, jsonFromVar(varNewKv(resultKv)));
+        } else {
+            for (unsigned int errIdx = 0; errIdx < strLstSize(errorList); errIdx++)
+            {
+                const String *const errStr = strLstGet(errorList, errIdx);
+                strCatFmt(resultStr, "\n  %s", strZ(errStr));
+            }
+        }
+
         // If verbose output or errors then output results
-        if (verboseText || errorTotal > 0)
+        if (!json && (verboseText || errorTotal > 0))
         {
             strCatFmt(
                 result, "stanza: %s\nstatus: %s%s", strZ(cfgOptionStr(cfgOptStanza)),
@@ -1879,7 +1991,8 @@ cmdVerify(void)
             LOG_INFO_FMT("%s", strZ(result));
 
             // Output to console when requested
-            if (cfgOptionStrId(cfgOptOutput) == CFGOPTVAL_OUTPUT_TEXT)
+            if (cfgOptionStrId(cfgOptOutput) == CFGOPTVAL_OUTPUT_TEXT
+                || cfgOptionStrId(cfgOptOutput) == CFGOPTVAL_OUTPUT_JSON)
             {
                 ioFdWriteOneStr(STDOUT_FILENO, result);
                 ioFdWriteOneStr(STDOUT_FILENO, LF_STR);
